@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>AP2 太阳系｜WebGL2.0 层级场景</title>
+<style>
+body {
+    background-color: #121212;
+    color: #ffffff;
+    font-family: system-ui, sans-serif;
+}
+canvas {
+    border: 2px solid #333;
+    background-color: black;
+}
+#ui-panel{
+    margin-bottom:10px;
+    padding:12px;
+    background:#222222;
+    max-width:820px;
+}
+.item{
+    margin:6px 0;
+}
+#hud{
+    position:absolute;
+    top:8px;
+    left:8px;
+    padding:4px 10px;
+    background:rgba(0,0,0,0.55);
+    border-radius:4px;
+    font-size:13px;
+    pointer-events:none;
+}
+</style>
+</head>
+<body>
+<div id="ui-panel">
+    <div class="item">
+        公转速度：<input type="range" id="speedRev" min="0" max="2.0" step="0.01" value="0.3">
+    </div>
+    <div class="item">
+        自转速度：<input type="range" id="speedRot" min="0" max="2.0" step="0.5" value="0.5">
+    </div>
+    <div class="item">
+        地轴倾角(°)：<input type="range" id="tiltEarth" min="0" max="45" step="0.1" value="23.5">
+    </div>
+    <div class="item">
+        显示轨道线：<input type="checkbox" id="showOrbit" checked>
+    </div>
+    <div class="item">
+        <p>按键说明：
+        <br>【O】切换正交/透视投影
+        <br>【空格】暂停/继续相机自动漫游
+        <br>鼠标拖拽画布：手动控制视角，接管漫游
+        </p>
+    </div>
+</div>
+<div id="hud"></div>
+<canvas id="glCanvas" width="800" height="600"></canvas>
+<script src="MV.js"></script>
+<script src="utility.js"></script>
+<script src="initShaders.js"></script>
+<script>
+let gl;
+let program;
+let lineProgram;
+let revSpeed = 0.3;
+let rotSpeed = 0.5;
+let earthAxisTilt = 23.5;
+let useOrthoProjection = false;
+let autoRoam = true;
+let roamAngle = 0.0;
+let dragActive = false;
+let mouseTheta = 0.0;
+let mousePhi = 0.6;
+let lastX = 0, lastY = 0;
+let texSun, texEarth, texMoon;
+let posBuffer, uvBuffer, idxBuffer;
+let orbitBuffer;
+let showOrbit = true;
+
+// 天体参数集中放这里，想调整半径/距离/周期直接改这个对象
+const CELESTIAL = {
+    sun:   { radius: 1.2 },
+    earth: { radius: 0.6,  distance: 4.0, revPeriod: 10.0, spinPeriod: 5.0, tilt: 23.5 },
+    moon:  { radius: 0.25, distance: 1.2, revPeriod: 4.0,  spinPeriod: 4.0, tilt: 5.0 }
+};
+
+const vertexShaderSource = `#version 300 es
+layout(location = 0) in vec3 vPosition;
+layout(location = 1) in vec2 vTexCoord;
+
+uniform mat4 uModelMat;
+uniform mat4 uViewMat;
+uniform mat4 uProjMat;
+
+out vec2 fTexCoord;
+
+void main(){
+    gl_Position = uProjMat * uViewMat * uModelMat * vec4(vPosition, 1.0);
+    fTexCoord = vTexCoord;
+}
+`;
+
+const fragmentShaderSource = `#version 300 es
+precision mediump float;
+
+uniform sampler2D uTexture;
+in vec2 fTexCoord;
+out vec4 fragColor;
+
+void main(){
+    fragColor = texture(uTexture, fTexCoord);
+}
+`;
+
+// 画轨道线用的简单着色器，只画颜色不贴图
+const lineVS = `#version 300 es
+layout(location = 0) in vec3 vPosition;
+
+uniform mat4 uModelMat;
+uniform mat4 uViewMat;
+uniform mat4 uProjMat;
+
+void main(){
+    gl_Position = uProjMat * uViewMat * uModelMat * vec4(vPosition, 1.0);
+}
+`;
+
+const lineFS = `#version 300 es
+precision mediump float;
+
+uniform vec4 uColor;
+out vec4 fragColor;
+
+void main(){
+    fragColor = uColor;
+}
+`;
+
+function generateSphere(subdivision = 24){
+    const positions = [];
+    const texCoords = [];
+    const indices = [];
+    for(let lat = 0; lat <= subdivision; lat++){
+        const theta = lat * Math.PI / subdivision;
+        const sinTheta = Math.sin(theta);
+        const cosTheta = Math.cos(theta);
+        for(let lon = 0; lon <= subdivision; lon++){
+            const phi = lon * 2.0 * Math.PI / subdivision;
+            const sinPhi = Math.sin(phi);
+            const cosPhi = Math.cos(phi);
+            positions.push(sinTheta*cosPhi, cosTheta, sinTheta*sinPhi);
+            texCoords.push(lon/subdivision, lat/subdivision);
+        }
+    }
+    for(let lat = 0; lat < subdivision; lat++){
+        for(let lon = 0; lon < subdivision; lon++){
+            const idxA = lat*(subdivision+1)+lon;
+            const idxB = idxA + 1;
+            const idxC = (lat+1)*(subdivision+1)+lon;
+            const idxD = idxC +1;
+            indices.push(idxA, idxC, idxB);
+            indices.push(idxB, idxC, idxD);
+        }
+    }
+    return {positions, texCoords, indices};
+}
+const sphereMesh = generateSphere(24);
+
+// 轨道线的点：单位圆（半径1），到时候用 scale 放大到想要的半径
+const ORBIT_SEG = 64;
+function makeOrbitPoints(radius){
+    const pts = [];
+    for(let i = 0; i < ORBIT_SEG; i++){
+        const a = i / ORBIT_SEG * 2.0 * Math.PI;
+        pts.push(radius * Math.cos(a), 0.0, radius * Math.sin(a));
+    }
+    return pts;
+}
+
+// 手写一个绕X轴的旋转矩阵，不调用 rotate()。
+// 根据教材 Ch4 的推导：绕X轴转 θ 的矩阵为
+// [ 1    0      0     0 ]
+// [ 0  cosθ  -sinθ   0 ]
+// [ 0  sinθ   cosθ   0 ]
+// [ 0    0      0     1 ]
+// 自己把 16 个元素填进 mat4()，再和别的变换用 mult() 组合
+function handRotateX(deg){
+    const rad = deg * Math.PI / 180.0;
+    const c = Math.cos(rad);
+    const s = Math.sin(rad);
+    const m = mat4(
+        1.0, 0.0, 0.0, 0.0,
+        0.0, c,  -s,  0.0,
+        0.0, s,   c,  0.0,
+        0.0, 0.0, 0.0, 1.0
+    );
+    return m;
+}
+
+function loadTexture(url){
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = ()=>{
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE, img);
+        gl.generateMipmap(gl.TEXTURE_2D);
+    };
+    img.src = url;
+    return texture;
+}
+
+function drawSphere(modelMatrix, texture){
+    gl.useProgram(program);
+    // 绑定球体两个缓冲：位置+纹理坐标
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+    gl.vertexAttribPointer(0,3,gl.FLOAT,false,0,0);
+    gl.enableVertexAttribArray(0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, uvBuffer);
+    gl.vertexAttribPointer(1,2,gl.FLOAT,false,0,0);
+    gl.enableVertexAttribArray(1);
+
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuffer);
+
+    gl.uniformMatrix4fv(gl.getUniformLocation(program,"uModelMat"), false, flatten(modelMatrix));
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.uniform1i(gl.getUniformLocation(program,"uTexture"), 0);
+    gl.drawElements(gl.TRIANGLES, sphereMesh.indices.length, gl.UNSIGNED_SHORT,0);
+}
+
+function drawOrbitLine(modelMatrix, color, viewMatrix, projMatrix){
+    gl.useProgram(lineProgram);
+    gl.bindBuffer(gl.ARRAY_BUFFER, orbitBuffer);
+    gl.vertexAttribPointer(0,3,gl.FLOAT,false,0,0);
+    gl.enableVertexAttribArray(0);
+
+    gl.uniformMatrix4fv(gl.getUniformLocation(lineProgram,"uModelMat"), false, flatten(modelMatrix));
+    gl.uniformMatrix4fv(gl.getUniformLocation(lineProgram,"uViewMat"), false, flatten(viewMatrix));
+    gl.uniformMatrix4fv(gl.getUniformLocation(lineProgram,"uProjMat"), false, flatten(projMatrix));
+    gl.uniform4fv(gl.getUniformLocation(lineProgram,"uColor"), color);
+    gl.drawArrays(gl.LINE_LOOP, 0, ORBIT_SEG);
+}
+
+function updateHUD(){
+    const el = document.getElementById("hud");
+    el.textContent = (useOrthoProjection ? "正交投影(ortho)" : "透视投影(perspective)")
+        + "  |  相机：" + (autoRoam ? "自动漫游(空格暂停)" : "鼠标拖拽");
+}
+
+window.onload = function(){
+    const canvas = document.getElementById("glCanvas");
+    gl = canvas.getContext("webgl2");
+    if(!gl){
+        alert("当前浏览器不支持WebGL2！");
+        return;
+    }
+    program = initShaders( gl, vertexShaderSource, fragmentShaderSource );
+    lineProgram = initShaders( gl, lineVS, lineFS );
+    console.log("program = ", program);
+    gl.useProgram( program );
+    gl.clearColor(0.0,0.0,0.0,1.0);
+    gl.enable(gl.DEPTH_TEST);
+    // 缓冲初始化
+    posBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(sphereMesh.positions), gl.STATIC_DRAW);
+    uvBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, uvBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(sphereMesh.texCoords), gl.STATIC_DRAW);
+    idxBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuffer);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(sphereMesh.indices), gl.STATIC_DRAW);
+    orbitBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, orbitBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(makeOrbitPoints(1.0)), gl.STATIC_DRAW);
+    texSun = loadTexture("textures/sun.jpg");
+    texEarth = loadTexture("textures/earth.jpg");
+    texMoon = loadTexture("textures/moon.jpg");
+    document.getElementById("speedRev").oninput = (e)=> revSpeed = parseFloat(e.target.value);
+    document.getElementById("speedRot").oninput = (e)=> rotSpeed = parseFloat(e.target.value);
+    document.getElementById("tiltEarth").oninput = (e)=> earthAxisTilt = parseFloat(e.target.value);
+    document.getElementById("showOrbit").onchange = (e)=> showOrbit = e.target.checked;
+    window.onkeydown = (ev)=>{
+        if(ev.code === "KeyO"){
+            useOrthoProjection = !useOrthoProjection;
+        }
+        if(ev.code === "Space"){
+            autoRoam = !autoRoam;
+            ev.preventDefault();
+        }
+        updateHUD();
+    };
+    canvas.onmousedown = (e)=>{
+        dragActive = true;
+        lastX = e.clientX;
+        lastY = e.clientY;
+        // 一拖拽就把漫游停掉，视角交给鼠标（随时可以互相接管）
+        autoRoam = false;
+        updateHUD();
+    };
+    canvas.onmouseup = ()=> dragActive = false;
+    canvas.onmousemove = (e)=>{
+        if(!dragActive) return;
+        const dx = e.clientX - lastX;
+        const dy = e.clientY - lastY;
+        mouseTheta += dx * 0.01;
+        mousePhi += dy * 0.01;
+        mousePhi = Math.max(-1.4, Math.min(1.4, mousePhi));
+        lastX = e.clientX;
+        lastY = e.clientY;
+    };
+    // 调试用：地址栏加 ?ortho=1 可直接用正交投影打开（方便截图对比）
+    if(location.search.indexOf("ortho=1") >= 0){
+        useOrthoProjection = true;
+    }
+    updateHUD();
+    let prevTime = 0;
+    function renderLoop(nowTime){
+        const deltaTime = (nowTime - prevTime)/1000.0;
+        prevTime = nowTime;
+        if(autoRoam){
+            roamAngle += deltaTime * 0.25;
+        }
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        const camDist = 12.0;
+        let camTheta, camPhi;
+        if(autoRoam){
+            camTheta = roamAngle;
+            // 漫游时加一点高度起伏，看起来像关键帧插值绕一圈
+            camPhi = 0.55 + 0.15 * Math.sin(roamAngle * 0.7);
+        }else{
+            camTheta = mouseTheta;
+            camPhi = mousePhi;
+        }
+        const eyeX = camDist * Math.sin(camPhi)*Math.cos(camTheta);
+        const eyeY = camDist * Math.cos(camPhi);
+        const eyeZ = camDist * Math.sin(camPhi)*Math.sin(camTheta);
+        const viewMatrix = lookAt( vec3(eyeX, eyeY, eyeZ), vec3(0,0,0), vec3(0, 1, 0) );
+        let projMatrix;
+        if(useOrthoProjection){
+            projMatrix = ortho(-6,6,-6,6, 1, 25);
+        }else{
+            projMatrix = perspective(45, canvas.width/canvas.height,0.1,100);
+        }
+        gl.uniformMatrix4fv(gl.getUniformLocation(program,"uViewMat"), false, flatten(viewMatrix));
+        gl.uniformMatrix4fv(gl.getUniformLocation(program,"uProjMat"), false, flatten(projMatrix));
+
+        const timeSec = nowTime / 1000.0;
+        const E = CELESTIAL.earth;
+        const M = CELESTIAL.moon;
+
+        // 太阳（静止在原点）
+        const sunMatrix = scale(CELESTIAL.sun.radius, CELESTIAL.sun.radius, CELESTIAL.sun.radius);
+        drawSphere(sunMatrix, texSun);
+
+        // 地球：自转 -> 倾角(先转后挂) -> 公转 -> 平移到轨道上
+        // 顺序写反的话（把公转放在平移后面）地球就只会在原地转，不会绕着太阳走
+        const matEarthRevolve   = rotate(timeSec * revSpeed * (2.0*Math.PI / E.revPeriod), 0,1,0);
+        const matEarthTranslate = translate(E.distance, 0, 0);
+        const matEarthTilt      = rotate(earthAxisTilt, 0,0,1);
+        const matEarthSpin      = rotate(timeSec * rotSpeed * (2.0*Math.PI / E.spinPeriod), 0,1,0);
+        const earthMatrix = mult(matEarthRevolve,
+                              mult(matEarthTranslate,
+                                mult(matEarthTilt, matEarthSpin)));
+        drawSphere(earthMatrix, texEarth);
+
+        // 月球：轨道面先用手写的矩阵倾斜 5°，再公转/平移，最后挂到"带倾角的地球"下面
+        const earthBase = mult(matEarthRevolve, mult(matEarthTranslate, matEarthTilt));
+        const matMoonTilt     = handRotateX(M.tilt);
+        const matMoonOrbitRot = rotate(timeSec * revSpeed * (2.0*Math.PI / M.revPeriod), 0,1,0);
+        const matMoonTrans    = translate(M.distance, 0, 0);
+        const matMoonSpin     = rotate(timeSec * rotSpeed * (2.0*Math.PI / M.spinPeriod), 0,1,0);
+        const moonLocalMat = mult(matMoonTilt,
+                              mult(matMoonTrans,
+                                mult(matMoonOrbitRot, matMoonSpin)));
+        const moonMatrix = mult(earthBase, moonLocalMat);
+        drawSphere(moonMatrix, texMoon);
+
+        // 轨道线：地球轨道在原点XZ平面，月球轨道画在地球坐标系里
+        if(showOrbit){
+            const earthOrbitMat = scale(E.distance, 1.0, E.distance);
+            drawOrbitLine(earthOrbitMat, [0.45,0.65,1.0,1.0], viewMatrix, projMatrix);
+            const moonOrbitMat = mult(earthBase, scale(M.distance, 1.0, M.distance));
+            drawOrbitLine(moonOrbitMat, [1.0,0.85,0.5,1.0], viewMatrix, projMatrix);
+        }
+
+        updateHUD();
+        requestAnimationFrame(renderLoop);
+    }
+    requestAnimationFrame(renderLoop);
+};
+</script>
+</body>
+</html>
