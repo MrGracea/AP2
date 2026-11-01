@@ -285,9 +285,9 @@ window.onload = function(){
     orbitBuffer = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, orbitBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(makeOrbitPoints(1.0)), gl.STATIC_DRAW);
-    texSun = loadTexture("textures/sun.jpg");
-    texEarth = loadTexture("textures/earth.jpg");
-    texMoon = loadTexture("textures/moon.jpg");
+    texSun = loadTexture("sun.jpg");
+    texEarth = loadTexture("earth.jpg");
+    texMoon = loadTexture("moon.jpg");
     document.getElementById("speedRev").oninput = (e)=> revSpeed = parseFloat(e.target.value);
     document.getElementById("speedRot").oninput = (e)=> rotSpeed = parseFloat(e.target.value);
     document.getElementById("tiltEarth").oninput = (e)=> earthAxisTilt = parseFloat(e.target.value);
